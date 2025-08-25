@@ -33,11 +33,11 @@ HECATE_PAGE = "https://hecate.ia.forth.gr/"   # human page (we'll try known down
 GLADE_PLUS_URL = "http://elysium.elte.hu/~dalyag/GLADE+.txt"
 
 CATALOG_LOCAL = "data/galaxy_catalog_hecate.csv"  # where catalog will be saved
-MAX_GALAXIES = 20             # number of galaxy centers to load (tune for speed)
-N_BODIES_PER_GAL = 50
-SPAWN_SIGMA_AU = 2e5
-TIME_YEARS = 1e6
-SAVE_INTERVAL_YEARS = 1e4
+MAX_GALAXIES = 5             # number of galaxy centers to load (tune for speed)
+N_BODIES_PER_GAL = 10
+SPAWN_SIGMA_AU = 2e2
+TIME_YEARS = 1e2
+SAVE_INTERVAL_YEARS = 5e1
 INITIAL_DT = 1.0
 G = 4 * math.pi**2  # AU^3 / (yr^2 * M_sun)
 
@@ -319,66 +319,92 @@ def spawn_bodies(centers, galaxy_masses, n_per=N_BODIES_PER_GAL, spawn_sigma=SPA
             body_gal[idx] = g
             idx += 1
     return pos, vel, masses, body_gal
-
 def simulate_from_catalog(catalog_path):
+    """
+    Robust simulation loop that:
+      - reads centers via parse_catalog_into_centers(...)
+      - spawns bodies via spawn_bodies(...)
+      - performs adaptive RK4 steps using pairwise_accelerations and rk4_step
+      - handles transfers, merges and splits safely (no shape-mutation bugs)
+      - saves snapshots every SAVE_INTERVAL_YEARS up to TIME_YEARS
+    Relies on global constants/functions defined elsewhere in the script:
+      N_BODIES_PER_GAL, SPAWN_SIGMA_AU, TIME_YEARS, SAVE_INTERVAL_YEARS,
+      INITIAL_DT, G, TIDAL_RADIUS_FACTOR, MERGE_DIST_AU, SPLIT_FRAC,
+      pairwise_accelerations, rk4_step, spawn_bodies, parse_catalog_into_centers.
+    """
+    # Load catalog
     centers, gal_masses, names = parse_catalog_into_centers(catalog_path, max_galaxies=MAX_GALAXIES)
     M = centers.shape[0]
-    print(f"debug: shape {centers.shape} shape[0] {centers.shape[0]}")
+    print(f"Using existing catalog at {catalog_path}")
     print(f"Loaded {M} galaxy centers from catalog.")
+    print(f"debug: shape {centers.shape} shape[0] {centers.shape[0]}")
+
+    # Spawn bodies (pos, vel, masses, body_gal)
     pos, vel, masses, body_gal = spawn_bodies(centers, gal_masses, n_per=N_BODIES_PER_GAL)
     N = pos.shape[0]
     print(f"Spawned {N} bodies ({N_BODIES_PER_GAL} per galaxy).")
 
+    # Work on independent copies so 'centers' is never mutated
     gal_pos = centers.copy()
     gal_vel = np.zeros_like(gal_pos)
-    gal_mass = gal_masses.copy()
+    gal_mass = np.array(gal_masses, copy=True)
+
     print(f"debug: shape {gal_pos.shape} shape[0] {gal_pos.shape[0]}")
     print(f"debug: shape {gal_vel.shape} shape[0] {gal_vel.shape[0]}")
     print(f"debug: shape {gal_mass.shape} shape[0] {gal_mass.shape[0]}")
 
-    acc_buf = np.zeros_like(pos)
-    gal_acc_buf = np.zeros_like(gal_pos)
+    # Buffers (ensure shapes match)
+    acc_buf = np.zeros_like(pos)            # body accelerations
+    gal_acc_buf = np.zeros((gal_pos.shape[0], 3))  # galaxy accelerations
+
     print(f"debug: shape {acc_buf.shape} shape[0] {acc_buf.shape[0]}")
     print(f"debug: shape {gal_acc_buf.shape} shape[0] {gal_acc_buf.shape[0]}")
 
-    save_times = np.arange(0.0, TIME_YEARS+1e-9, SAVE_INTERVAL_YEARS)
+    # Snapshots
+    save_times = np.arange(0.0, TIME_YEARS + 1e-9, SAVE_INTERVAL_YEARS)
     n_snap = save_times.shape[0]
     snapshots_pos = np.zeros((n_snap, N, 3))
     snapshots_vel = np.zeros((n_snap, N, 3))
     snapshots_pos[0] = pos
     snapshots_vel[0] = vel
+
     t = 0.0
     dt = INITIAL_DT
 
+    # MAIN TIME LOOP
     for s_idx in range(1, n_snap):
         target_t = save_times[s_idx]
         while t < target_t - 1e-12:
+            # --- body-body pairwise accelerations (fills acc_buf) ---
             pairwise_accelerations(pos, masses, acc_buf)
-            print("pass 1")
-            print(f"debug: shape {gal_pos.shape} shape[0] {gal_pos.shape[0]}")
-            print(f"debug: shape {gal_vel.shape} shape[0] {gal_vel.shape[0]}")
-            print(f"debug: shape {gal_mass.shape} shape[0] {gal_mass.shape[0]}")
-            # add galaxy center attraction
+            # debug pass
+            # print("pass 1")
+            # print(f"debug: shape {gal_pos.shape} shape[0] {gal_pos.shape[0]}")
+
+            # --- add galaxy center attraction to bodies ---
+            # ensure M is current
+            M = gal_pos.shape[0]
             for i in range(N):
-                ax = ay = az = 0.0
                 xi, yi, zi = pos[i]
+                ax = ay = az = 0.0
+                # loop current galaxies
                 for g in range(M):
-                    dx = gal_pos[g,0] - xi
-                    dy = gal_pos[g,1] - yi
-                    dz = gal_pos[g,2] - zi
+                    dx = gal_pos[g, 0] - xi
+                    dy = gal_pos[g, 1] - yi
+                    dz = gal_pos[g, 2] - zi
                     dsq = dx*dx + dy*dy + dz*dz + 1e-12
                     inv_r3 = 1.0 / (dsq * math.sqrt(dsq))
                     factor = G * gal_mass[g] * inv_r3
                     ax += dx * factor
                     ay += dy * factor
                     az += dz * factor
-                acc_buf[i,0] += ax
-                acc_buf[i,1] += ay
-                acc_buf[i,2] += az
+                acc_buf[i, 0] += ax
+                acc_buf[i, 1] += ay
+                acc_buf[i, 2] += az
 
-            # adapt dt simple heuristic
+            # --- adaptive dt heuristic ---
             max_acc = np.max(np.sqrt((acc_buf**2).sum(axis=1))) + 1e-12
-            min_dist = 1e30
+            min_dist = np.inf
             for i in range(N):
                 for j in range(i+1, N):
                     d = np.linalg.norm(pos[i] - pos[j])
@@ -387,25 +413,35 @@ def simulate_from_catalog(catalog_path):
             suggested_dt = 0.2 * math.sqrt(min_dist / (max_acc + 1e-12))
             dt = max(1e-6, min(1e3, suggested_dt))
 
+            # --- RK4 steps ---
             rk4_step(pos, vel, masses, dt, acc_buf)
+
+            # galaxy-galaxy accelerations & RK4
+            # ensure gal_acc_buf matches current M
+            if gal_acc_buf.shape[0] != gal_pos.shape[0]:
+                gal_acc_buf = np.zeros((gal_pos.shape[0], 3))
             pairwise_accelerations(gal_pos, gal_mass, gal_acc_buf)
             rk4_step(gal_pos, gal_vel, gal_mass, dt, gal_acc_buf)
-            print("pass 2")
-            print(f"debug: shape {gal_pos.shape} shape[0] {gal_pos.shape[0]}")
-            print(f"debug: shape {gal_vel.shape} shape[0] {gal_vel.shape[0]}")
-            print(f"debug: shape {gal_mass.shape} shape[0] {gal_mass.shape[0]}")
+
+            # debug pass 2
+            # print("pass 2")
             t += dt
 
-            # transfers
+            # ---------------- TRANSFERS ----------------
             tidal_radius = TIDAL_RADIUS_FACTOR * SPAWN_SIGMA_AU
+            # body_gal values refer to current galaxy indexing [0..M-1]
             for i in range(N):
-                gidx = body_gal[i]
+                gidx = int(body_gal[i])
+                # skip invalid gidx (shouldn't happen)
+                if gidx < 0 or gidx >= gal_pos.shape[0]:
+                    continue
                 rmag = np.linalg.norm(pos[i] - gal_pos[gidx])
                 if rmag > tidal_radius:
                     nearest_g = gidx
                     nearest_d = rmag
-                    for g in range(M):
-                        if g == gidx: continue
+                    for g in range(gal_pos.shape[0]):
+                        if g == gidx:
+                            continue
                         d = np.linalg.norm(pos[i] - gal_pos[g])
                         if d < nearest_d:
                             nearest_d = d
@@ -415,38 +451,57 @@ def simulate_from_catalog(catalog_path):
                         gal_mass[nearest_g] += masses[i]
                         gal_mass[gidx] -= masses[i]
 
-            # merges
-            merged = False
+            # ---------------- MERGES ----------------
+            # Merge pairs (b -> a). We will reindex arrays afterwards safely.
+            M = gal_pos.shape[0]
+            removed = set()
+            # For stability, perform merges by marking removed indices and
+            # reassigning bodies to the 'a' target immediately.
             for a in range(M):
+                if a in removed:
+                    continue
                 for b in range(a+1, M):
+                    if b in removed:
+                        continue
                     d = np.linalg.norm(gal_pos[a] - gal_pos[b])
                     if d < MERGE_DIST_AU:
+                        # merge b into a
                         total_mass = gal_mass[a] + gal_mass[b]
+                        if total_mass <= 0:
+                            # avoid divide by zero; skip merge
+                            continue
                         new_pos = (gal_mass[a]*gal_pos[a] + gal_mass[b]*gal_pos[b]) / total_mass
                         new_vel = (gal_mass[a]*gal_vel[a] + gal_mass[b]*gal_vel[b]) / total_mass
                         gal_pos[a] = new_pos
                         gal_vel[a] = new_vel
                         gal_mass[a] = total_mass
-                        for i in range(N):
-                            if body_gal[i] == b:
-                                body_gal[i] = a
-                        if b != M-1:
-                            gal_pos[b] = gal_pos[M-1].copy()
-                            gal_vel[b] = gal_vel[M-1].copy()
-                            gal_mass[b] = gal_mass[M-1]
-                            for i in range(N):
-                                if body_gal[i] == M-1:
-                                    body_gal[i] = b
-                        M -= 1
-                        gal_pos = gal_pos[:M]
-                        gal_vel = gal_vel[:M]
-                        gal_mass = gal_mass[:M]
-                        merged = True
-                        break
-                if merged:
-                    break
+                        # reassign bodies of b -> a now
+                        body_gal[body_gal == b] = a
+                        removed.add(b)
+            if removed:
+                # Build keep indices (not removed)
+                keep_idx = [i for i in range(M) if i not in removed]
+                # build remap old->new index
+                remap = np.empty(M, dtype=np.int32)
+                for new_i, old_i in enumerate(keep_idx):
+                    remap[old_i] = new_i
+                # apply remapping to body_gal
+                body_gal = remap[body_gal]
+                # rebuild galaxy arrays
+                gal_pos = gal_pos[keep_idx].copy()
+                gal_vel = gal_vel[keep_idx].copy()
+                gal_mass = gal_mass[keep_idx].copy()
+                # recreate gal_acc_buf with new size
+                gal_acc_buf = np.zeros((gal_pos.shape[0], 3))
+                M = gal_pos.shape[0]
 
-            # split logic
+            # ---------------- SPLITS ----------------
+            # Collect new galaxies and reassign bodies to provisional new indices
+            M = gal_pos.shape[0]
+            new_pos_list = []
+            new_vel_list = []
+            new_mass_list = []
+            # we will assign body_gal to provisional new indices as we create them
             for g in range(M):
                 assigned = np.where(body_gal == g)[0]
                 if assigned.size == 0:
@@ -455,23 +510,45 @@ def simulate_from_catalog(catalog_path):
                 split_radius = 3.0 * SPAWN_SIGMA_AU
                 frac_out = np.sum(distances > split_radius) / assigned.size
                 if frac_out > SPLIT_FRAC and gal_mass[g] > 2e6:
-                    esc_idxs = assigned[distances > split_radius]
+                    esc_mask = distances > split_radius
+                    esc_idxs = assigned[esc_mask]
+                    if esc_idxs.size == 0:
+                        continue
                     centroid = pos[esc_idxs].mean(axis=0)
                     new_mass = np.sum(masses[esc_idxs])
-                    gal_mass[g] -= new_mass
-                    gal_pos = np.vstack([gal_pos, centroid])
-                    gal_vel = np.vstack([gal_vel, np.zeros(3)])
-                    gal_mass = np.concatenate([gal_mass, np.array([new_mass])])
-                    new_g = gal_pos.shape[0]-1
+                    # reduce original galaxy mass
+                    gal_mass[g] = gal_mass[g] - new_mass
+                    # append new galaxy (stored in lists for now)
+                    new_pos_list.append(np.array(centroid, dtype=float))
+                    new_vel_list.append(np.zeros(3, dtype=float))
+                    new_mass_list.append(float(new_mass))
+                    # provisional new index (will be M + index_in_new_pos_list - 1)
+                    provisional_index = M + len(new_pos_list) - 1
+                    # assign those bodies to the provisional index
                     for i in esc_idxs:
-                        body_gal[i] = new_g
-                    M += 1
+                        body_gal[i] = provisional_index
 
+            # If there are new galaxies, append them in one safe step
+            if len(new_pos_list) > 0:
+                new_pos_arr = np.vstack([p.reshape(1,3) for p in new_pos_list])
+                new_vel_arr = np.vstack([v.reshape(1,3) for v in new_vel_list])
+                new_mass_arr = np.atleast_1d(np.array(new_mass_list, dtype=float))
+                gal_pos = np.vstack([gal_pos, new_pos_arr])
+                gal_vel = np.vstack([gal_vel, new_vel_arr])
+                gal_mass = np.concatenate([gal_mass, new_mass_arr])
+                # recreate gal_acc_buf with new size
+                gal_acc_buf = np.zeros((gal_pos.shape[0], 3))
+                M = gal_pos.shape[0]
+
+        # end while for snapshot
         snapshots_pos[s_idx] = pos
         snapshots_vel[s_idx] = vel
-        pct = int(100.0 * (s_idx) / (n_snap-1))
+        pct = int(100.0 * (s_idx) / (n_snap - 1))
         print(f"{pct}% complete (t = {t:.2f} yr)")
 
+    # END time loop
+
+    # Save results
     os.makedirs("data", exist_ok=True)
     np.savez("data/galaxy_sim_hecate.npz",
              body_positions = snapshots_pos,
