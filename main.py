@@ -1,496 +1,164 @@
-# galaxy_sim_with_hecate.py
+#!/usr/bin/env python3
 """
-Auto-download HECATE (fallback: GLADE+) and run the galaxy-body simulation.
-Save snapshots to data/galaxy_sim_hecate.npz
+lunar_eclipse_sim.py
 
-Requirements:
-  - numpy
-  - scipy (optional)
-  - pandas
-  - numba (optional but recommended)
-  - requests
-Install e.g.: pip install numpy pandas numba requests
+Creates a 2D side-view animation (GIF) of Sun-Earth-Moon:
+- Moon orbits Earth with ~5.145° inclination and nodal precession (~18.6 years).
+- Earth's umbra at lunar distance is computed; frames where the Moon is inside umbra are detected.
+- Saves GIF to ./lunar_eclipse_sim.gif
+
+Dependencies:
+    pip install numpy matplotlib pillow
 """
 
-import os
-import io
-import sys
-import math
 import numpy as np
-import pandas as pd
-from time import perf_counter
+import matplotlib.pyplot as plt
+from matplotlib import animation
+from matplotlib.patches import Circle
+import math
 
-# try Numba
-try:
-    from numba import njit
-    NUMBA = True
-except Exception:
-    NUMBA = False
+# -------------------------
+# Physical constants (km)
+Re = 6371.0              # Earth radius
+Rs = 696340.0            # Sun radius
+d_SE = 149600000.0       # Sun-Earth distance
+d_EM = 384400.0          # Earth-Moon distance
 
-# ----------------- CONFIG --------------------
-HECATE_PAGE = "https://hecate.ia.forth.gr/"   # human page (we'll try known download endpoints)
-# Fallback direct GLADE+ download (public link referenced by GLADE authors)
-GLADE_PLUS_URL = "http://elysium.elte.hu/~dalyag/GLADE+.txt"
+# Units: 1 Moon-distance = 1 unit
+scale = d_EM
+Re_u = Re / scale
+Rs_u = Rs / scale
+d_SE_u = d_SE / scale
 
-CATALOG_LOCAL = "data/galaxy_catalog_hecate.csv"  # where catalog will be saved
-MAX_GALAXIES = 20             # number of galaxy centers to load (tune for speed)
-N_BODIES_PER_GAL = 50
-SPAWN_SIGMA_AU = 2e5
-TIME_YEARS = 1e6
-SAVE_INTERVAL_YEARS = 1e4
-INITIAL_DT = 1.0
-G = 4 * math.pi**2  # AU^3 / (yr^2 * M_sun)
+# Moon orbit parameters
+inc_deg = 5.145         # inclination w.r.t ecliptic (degrees)
+inc = np.deg2rad(inc_deg)
+T_moon = 27.321661      # sidereal period (days)
+n_deg_day = 360.0 / T_moon
 
-# thresholds
-TIDAL_RADIUS_FACTOR = 5.0
-MERGE_DIST_AU = 1e7
-SPLIT_FRAC = 0.4
+# Nodal precession (regression) ~18.6 years (period)
+precession_years = 18.6
+precession_deg_per_year = -360.0 / precession_years
+precession_deg_per_day = precession_deg_per_year / 365.25
+precession_rad_per_day = np.deg2rad(precession_deg_per_day)
 
-# ---------- small helpers ----------
-AU_PER_PC = 206264.806
-AU_PER_MPC = AU_PER_PC * 1e6
+# Umbra cone length and umbra radius at Moon distance (approx)
+L_umbra = Re * d_SE / (Rs - Re)    # km
+r_umbra_km = Re * (1 - (d_EM / L_umbra))
+r_umbra_u = r_umbra_km / scale
 
-def try_download_hecate(dest_path):
+# Simulation time and frames
+years_to_sim = 5.0    # compress a few years so precession is visible
+days_total = years_to_sim * 365.25
+n_frames = 400
+t_array = np.linspace(-10.0, days_total + 10.0, n_frames)  # days
+
+# Sun position on negative x-axis (in Earth-centered units)
+sun_pos = np.array([-d_SE_u, 0.0, 0.0])
+
+# Initial node angle (Omega)
+Omega0 = 0.0
+
+def moon_position(t_days):
     """
-    Attempt to download a CSV from HECATE. The website provides CSV, VOTable, FITS, IPAC.
-    We try a few guesses, and then fail gracefully.
+    Return moon position in Earth-centered coordinates (units of lunar distance).
+    Uses: rotate by Omega around z, then incline by inc about x (Rz * Rx).
     """
-    import requests, time
-    tried = []
-    # common guesses (the site lists CSV download option; exact endpoint may vary)
-    urls_to_try = [
-        "https://hecate.ia.forth.gr/catalog.csv",
-        "https://hecate.ia.forth.gr/catalog/hecate.csv",
-        "https://hecate.ia.forth.gr/download/hecate.csv",
-        "https://hecate.ia.forth.gr/downloads/hecate.csv"
-    ]
-    for u in urls_to_try:
-        try:
-            r = requests.get(u, timeout=15)
-            tried.append((u, r.status_code))
-            if r.status_code == 200 and len(r.content) > 200:
-                with open(dest_path, "wb") as f:
-                    f.write(r.content)
-                return True, u
-        except Exception:
-            continue
-    return False, tried
+    theta = np.deg2rad(n_deg_day * t_days)        # mean anomaly angle (orbital phase)
+    Omega = Omega0 + precession_rad_per_day * t_days
+    r = 1.0  # approx circular orbit with radius = 1 unit (Moon distance)
+    x_orb = r * np.cos(theta)
+    y_orb = r * np.sin(theta)
+    z_orb = 0.0
 
-def download_fallback_glade(dest_path):
-    import requests
-    print("Downloading fallback GLADE+ (this is large — if you want a smaller sample edit MAX_GALAXIES).")
-    r = requests.get(GLADE_PLUS_URL, stream=True, timeout=60)
-    if r.status_code == 200:
-        # GLADE+ is an ASCII text file; we'll save locally
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1<<20):
-                if chunk:
-                    f.write(chunk)
-        return True
-    return False
+    # Rx(inc)
+    cosi = np.cos(inc); sini = np.sin(inc)
+    x1 = x_orb
+    y1 = y_orb * cosi - z_orb * sini
+    z1 = y_orb * sini + z_orb * cosi
 
-def ensure_catalog(path=CATALOG_LOCAL):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if os.path.exists(path):
-        print(f"Using existing catalog at {path}")
-        return path
-    # try HECATE first
-    try:
-        ok, info = try_download_hecate(path)
-    except Exception as e:
-        ok = False
-        info = str(e)
-    if ok:
-        print("Downloaded HECATE from", info)
-        return path
-    print("HECATE automatic download failed; trying GLADE+ fallback...")
-    ok2 = download_fallback_glade(path)
-    if ok2:
-        print("Downloaded GLADE+ fallback to", path)
-        return path
-    raise RuntimeError("Failed to download both HECATE and GLADE+ catalogs. Please download manually and set CATALOG_LOCAL.")
+    # Rz(Omega)
+    cosO = np.cos(Omega); sinO = np.sin(Omega)
+    x = cosO * x1 - sinO * y1
+    y = sinO * x1 + cosO * y1
+    z = z1
+    return np.array([x, y, z])
 
-# ----------------- Catalog parsing -----------------
-def parse_catalog_into_centers(catalog_path, max_galaxies=MAX_GALAXIES):
-    """
-    Read CSV/txt and detect RA, Dec and distance columns. Return:
-      centers (M,3) in AU, galaxy_masses (M,) in solar masses, names list
-    The function auto-detects common column names.
-    """
-    # try reading with pandas; for GLADE+ space-delimited txt we try delim_whitespace if CSV fails
-    try:
-        df = pd.read_csv(catalog_path)
-    except Exception:
-        try:
-            df = pd.read_csv(catalog_path, delim_whitespace=True, comment='#', header=None)
-            # try to load columns if possible - fallback to raw columns
-        except Exception as e:
-            raise RuntimeError("Failed to read catalog file: " + str(e))
+# Precompute moon positions and umbra membership
+moon_pos = np.array([moon_position(t) for t in t_array])
 
-    # auto-detect RA/Dec columns
-    ra_candidates = [c for c in df.columns if c.lower() in ('ra', 'ra_deg', 'ra_deg.')]
-    dec_candidates = [c for c in df.columns if c.lower() in ('dec', 'dec_deg', 'dec_deg.')]
-    dist_candidates = [c for c in df.columns if c.lower() in ('d','dist','distance','dist_mpc','dist_pc','d_mpc','d_pc')]
-    mass_candidates = [c for c in df.columns if c.lower() in ('stellar_mass','mass','mstar','logmstar','log_mass','log_mass_stellar','m')]
+sun_dir = (sun_pos - np.array([0.0, 0.0, 0.0]))
+sun_dir = sun_dir / np.linalg.norm(sun_dir)
+shadow_axis = -sun_dir  # direction from Earth toward the shadow (points roughly +x)
 
-    if not ra_candidates or not dec_candidates:
-        # try columns named 'RA'/'DEC' in uppercase variants
-        for c in df.columns:
-            if c.strip().lower().startswith('ra'):
-                ra_candidates.append(c)
-            if c.strip().lower().startswith('dec'):
-                dec_candidates.append(c)
+in_umbra = []
+for r in moon_pos:
+    proj = np.dot(r, shadow_axis)
+    perp = r - proj * shadow_axis
+    dist_axis = np.linalg.norm(perp)
+    # Moon must be behind Earth relative to Sun (proj > 0) and within umbra radius
+    cond = (proj > 0.0) and (dist_axis < r_umbra_u)
+    in_umbra.append(cond)
+in_umbra = np.array(in_umbra)
 
-    if not dist_candidates:
-        # check for column named 'd' (HECATE uses 'd' in Mpc)
-        for c in df.columns:
-            if c.strip().lower() == 'd' or 'dist' in c.lower():
-                dist_candidates.append(c)
+# -------------------------
+# Create animation (side view: x vs z)
+fig, ax = plt.subplots(figsize=(6, 6))
+ax.set_xlim(-1.5, 1.5)
+ax.set_ylim(-1.2, 1.2)
+ax.set_aspect('equal', 'box')
+ax.set_title('Moon, Earth and Umbra (side view). Time compressed: {:.1f} years'.format(years_to_sim))
 
-    # fallback defaults
-    ra_col = ra_candidates[0] if ra_candidates else None
-    dec_col = dec_candidates[0] if dec_candidates else None
-    dist_col = dist_candidates[0] if dist_candidates else None
-    mass_col = mass_candidates[0] if mass_candidates else None
+# Sun marker (left)
+ax.plot([sun_pos[0]], [0.0], marker='o', markersize=10)
+ax.text(sun_pos[0], -0.1, 'Sun', fontsize=8, ha='center')
 
-    centers = []
-    masses = []
-    names = []
-    rows = df.shape[0]
-    for idx in range(min(rows, max_galaxies*10)):  # scan up to a larger window to find good rows
-        if ra_col is None or dec_col is None:
-            break
-        try:
-            ra = float(df.iloc[idx][ra_col])
-            dec = float(df.iloc[idx][dec_col])
-            # distance
-            if dist_col is not None:
-                dist_val = df.iloc[idx][dist_col]
-                if pd.isna(dist_val):
-                    # skip
-                    continue
-                # guess units: if dist_col contains 'mpc' or 'Mpc' treat as Mpc
-                if 'mpc' in str(dist_col).lower() or (isinstance(dist_val, (int,float)) and dist_val < 100):
-                    # small values <100 probably Mpc (HECATE 'd' is in Mpc)
-                    dist_pc = float(dist_val) * 1e6
-                else:
-                    dist_pc = float(dist_val)
-            else:
-                # fallback: assume 1 Mpc
-                dist_pc = 1e6
+# Earth (drawn larger for visibility)
+earth_circle = Circle((0.0, 0.0), Re_u * 4.0, fill=False, linewidth=1.2)
+ax.add_patch(earth_circle)
+ax.text(0.02, -0.05, 'Earth (not to scale)', fontsize=8)
 
-            # convert to AU
-            r_au = dist_pc * AU_PER_PC
-            # cartesian
-            ra_rad = math.radians(ra)
-            dec_rad = math.radians(dec)
-            x = r_au * math.cos(dec_rad) * math.cos(ra_rad)
-            y = r_au * math.cos(dec_rad) * math.sin(ra_rad)
-            z = r_au * math.sin(dec_rad)
-            centers.append(np.array([x,y,z]))
-            # mass detection
-            if mass_col is not None:
-                mval = df.iloc[idx][mass_col]
-                if pd.isna(mval):
-                    mass = 1e11
-                else:
-                    try:
-                        # if log mass given (e.g., 'logmstar') detect via column name
-                        if 'log' in str(mass_col).lower() or str(mass_col).lower().startswith('log'):
-                            mass = 10**(float(mval))
-                        else:
-                            mass = float(mval)
-                            # if mass seems tiny (<1e6) maybe it's log -> fallback
-                            if mass < 1e6:
-                                # assume it's log mass
-                                mass = 10**mass
-                    except Exception:
-                        mass = 1e11
-            else:
-                mass = 1e11
-            masses.append(mass)
-            names.append(str(df.columns[0]) + f"_{idx}" if 'name' not in df.columns else str(df.iloc[idx].get('name', f'gal_{idx}')))
-            if len(centers) >= max_galaxies:
-                break
-        except Exception:
-            continue
+# Umbra circle at Moon distance (projected onto side view)
+shadow_center = shadow_axis * 1.0
+umbra_circle = Circle((shadow_center[0], shadow_center[2]), r_umbra_u, fill=False, linestyle='--')
+ax.add_patch(umbra_circle)
+ax.text(shadow_center[0] + 0.02, shadow_center[2], 'Umbra @ Moon dist', fontsize=8)
 
-    if len(centers) == 0:
-        raise RuntimeError("No valid galaxy rows found in catalog. Inspect file and column names (RA/Dec/distance).")
+# Moon plot handle
+moon_marker, = ax.plot([], [], marker='o', markersize=8)
 
-    centers = np.vstack(centers)
-    masses = np.array(masses)
-    return centers, masses, names
+# Info text
+time_text = ax.text(-1.4, 1.0, '', fontsize=9)
+status_text = ax.text(-1.4, 0.9, '', fontsize=9)
 
-# ----------------- physics & integrator (same approach as before) -----------------
-if NUMBA:
-    njit_decorator = njit
-else:
-    def njit_decorator(f):
-        return f
+def init():
+    moon_marker.set_data([], [])
+    time_text.set_text('')
+    status_text.set_text('')
+    return moon_marker, time_text, status_text
 
-@njit_decorator
-def pairwise_accelerations(positions, masses, accelerations):
-    N = positions.shape[0]
-    for i in range(N):
-        accelerations[i,0] = 0.0
-        accelerations[i,1] = 0.0
-        accelerations[i,2] = 0.0
-    for i in range(N):
-        xi, yi, zi = positions[i,0], positions[i,1], positions[i,2]
-        mi = masses[i]
-        axi = 0.0; ayi = 0.0; azi = 0.0
+def update(frame):
+    r = moon_pos[frame]
+    x = r[0]; z = r[2]
+    moon_marker.set_data([x], [z])   # <-- FIX HERE
+    Omega = Omega0 + precession_rad_per_day * t_array[frame]
+    node_deg = np.rad2deg(Omega) % 360.0
+    t_days = t_array[frame]
+    time_text.set_text('t = {:.1f} days\nNode (Ω) = {:.1f}°'.format(t_days, node_deg))
+    status = 'In umbra' if in_umbra[frame] else 'Not in umbra'
+    status_text.set_text(status)
+    return moon_marker, time_text, status_text
 
-        for j in range(i+1, N):
-            dx = positions[j,0] - xi
-            dy = positions[j,1] - yi
-            dz = positions[j,2] - zi
-            dist_sqr = dx*dx + dy*dy + dz*dz
-            if dist_sqr < 1e-20:
-                continue
-            dist_cubed = dist_sqr * math.sqrt(dist_sqr)
-            factor = G / dist_cubed
-            fx = dx * factor
-            fy = dy * factor
-            fz = dz * factor
-            mj = masses[j]
-            axi += fx * mj
-            ayi += fy * mj
-            azi += fz * mj
-            accelerations[j,0] -= fx * mi
-            accelerations[j,1] -= fy * mi
-            accelerations[j,2] -= fz * mi
-        accelerations[i,0] += axi
-        accelerations[i,1] += ayi
-        accelerations[i,2] += azi
-    return accelerations
 
-@njit_decorator
-def rk4_step(positions, velocities, masses, dt, acc_buf):
-    N = positions.shape[0]
-    pairwise_accelerations(positions, masses, acc_buf)
-    k1_v = acc_buf.copy()
-    k1_x = velocities.copy()
+anim = animation.FuncAnimation(fig, update, init_func=init,
+                               frames=n_frames, interval=30, blit=True)
 
-    pos_tmp = positions + 0.5 * dt * k1_x
-    vel_tmp = velocities + 0.5 * dt * k1_v
-    pairwise_accelerations(pos_tmp, masses, acc_buf)
-    k2_v = acc_buf.copy()
-    k2_x = vel_tmp.copy()
+# # Save as GIF
+# gif_path = 'lunar_eclipse_sim.gif'
+# from matplotlib.animation import PillowWriter
+# writer = PillowWriter(fps=20)
+# anim.save(gif_path, writer=writer)
 
-    pos_tmp = positions + 0.5 * dt * k2_x
-    vel_tmp = velocities + 0.5 * dt * k2_v
-    pairwise_accelerations(pos_tmp, masses, acc_buf)
-    k3_v = acc_buf.copy()
-    k3_x = vel_tmp.copy()
 
-    pos_tmp = positions + dt * k3_x
-    vel_tmp = velocities + dt * k3_v
-    pairwise_accelerations(pos_tmp, masses, acc_buf)
-    k4_v = acc_buf.copy()
-    k4_x = vel_tmp.copy()
+anim.save('lunar_eclipse_sim.mp4', fps=30, writer='ffmpeg')
 
-    for i in range(N):
-        for k in range(3):
-            positions[i,k] += dt * (k1_x[i,k] + 2*k2_x[i,k] + 2*k3_x[i,k] + k4_x[i,k]) / 6.0
-            velocities[i,k] += dt * (k1_v[i,k] + 2*k2_v[i,k] + 2*k3_v[i,k] + k4_v[i,k]) / 6.0
-
-# ----------------- spawn & simulate -----------------
-def spawn_bodies(centers, galaxy_masses, n_per=N_BODIES_PER_GAL, spawn_sigma=SPAWN_SIGMA_AU):
-    M = centers.shape[0]
-    Ntot = M * n_per
-    pos = np.zeros((Ntot,3))
-    vel = np.zeros((Ntot,3))
-    masses = np.ones(Ntot)
-    body_gal = np.zeros(Ntot, dtype=np.int32)
-    idx = 0
-    rng = np.random.RandomState(1234)
-    for g in range(M):
-        cen = centers[g]
-        for i in range(n_per):
-            r_offset = rng.normal(scale=spawn_sigma, size=3)
-            pos[idx] = cen + r_offset
-            v_rand = rng.normal(scale=1e-2, size=3)
-            rmag = np.linalg.norm(r_offset) + 1e-8
-            bias_mag = 0.05 * math.sqrt(galaxy_masses[g] / (1e10)) / (rmag/1e5 + 1e-6)
-            bias = - (r_offset / rmag) * bias_mag
-            vel[idx] = v_rand + bias
-            masses[idx] = 1.0
-            body_gal[idx] = g
-            idx += 1
-    return pos, vel, masses, body_gal
-
-def simulate_from_catalog(catalog_path):
-    centers, gal_masses, names = parse_catalog_into_centers(catalog_path, max_galaxies=MAX_GALAXIES)
-    M = centers.shape[0]
-    print(f"debug: shape {centers.shape} shape[0] {centers.shape[0]}")
-    print(f"Loaded {M} galaxy centers from catalog.")
-    pos, vel, masses, body_gal = spawn_bodies(centers, gal_masses, n_per=N_BODIES_PER_GAL)
-    N = pos.shape[0]
-    print(f"Spawned {N} bodies ({N_BODIES_PER_GAL} per galaxy).")
-
-    gal_pos = centers.copy()
-    gal_vel = np.zeros_like(gal_pos)
-    gal_mass = gal_masses.copy()
-    print(f"debug: shape {gal_pos.shape} shape[0] {gal_pos.shape[0]}")
-    print(f"debug: shape {gal_vel.shape} shape[0] {gal_vel.shape[0]}")
-    print(f"debug: shape {gal_mass.shape} shape[0] {gal_mass.shape[0]}")
-
-    acc_buf = np.zeros_like(pos)
-    gal_acc_buf = np.zeros_like(gal_pos)
-    print(f"debug: shape {acc_buf.shape} shape[0] {acc_buf.shape[0]}")
-    print(f"debug: shape {gal_acc_buf.shape} shape[0] {gal_acc_buf.shape[0]}")
-
-    save_times = np.arange(0.0, TIME_YEARS+1e-9, SAVE_INTERVAL_YEARS)
-    n_snap = save_times.shape[0]
-    snapshots_pos = np.zeros((n_snap, N, 3))
-    snapshots_vel = np.zeros((n_snap, N, 3))
-    snapshots_pos[0] = pos
-    snapshots_vel[0] = vel
-    t = 0.0
-    dt = INITIAL_DT
-
-    for s_idx in range(1, n_snap):
-        target_t = save_times[s_idx]
-        while t < target_t - 1e-12:
-            pairwise_accelerations(pos, masses, acc_buf)
-            print("pass 1")
-            print(f"debug: shape {gal_pos.shape} shape[0] {gal_pos.shape[0]}")
-            print(f"debug: shape {gal_vel.shape} shape[0] {gal_vel.shape[0]}")
-            print(f"debug: shape {gal_mass.shape} shape[0] {gal_mass.shape[0]}")
-            # add galaxy center attraction
-            for i in range(N):
-                ax = ay = az = 0.0
-                xi, yi, zi = pos[i]
-                for g in range(M):
-                    dx = gal_pos[g,0] - xi
-                    dy = gal_pos[g,1] - yi
-                    dz = gal_pos[g,2] - zi
-                    dsq = dx*dx + dy*dy + dz*dz + 1e-12
-                    inv_r3 = 1.0 / (dsq * math.sqrt(dsq))
-                    factor = G * gal_mass[g] * inv_r3
-                    ax += dx * factor
-                    ay += dy * factor
-                    az += dz * factor
-                acc_buf[i,0] += ax
-                acc_buf[i,1] += ay
-                acc_buf[i,2] += az
-
-            # adapt dt simple heuristic
-            max_acc = np.max(np.sqrt((acc_buf**2).sum(axis=1))) + 1e-12
-            min_dist = 1e30
-            for i in range(N):
-                for j in range(i+1, N):
-                    d = np.linalg.norm(pos[i] - pos[j])
-                    if d < min_dist:
-                        min_dist = d
-            suggested_dt = 0.2 * math.sqrt(min_dist / (max_acc + 1e-12))
-            dt = max(1e-6, min(1e3, suggested_dt))
-
-            rk4_step(pos, vel, masses, dt, acc_buf)
-            pairwise_accelerations(gal_pos, gal_mass, gal_acc_buf)
-            rk4_step(gal_pos, gal_vel, gal_mass, dt, gal_acc_buf)
-            print("pass 2")
-            print(f"debug: shape {gal_pos.shape} shape[0] {gal_pos.shape[0]}")
-            print(f"debug: shape {gal_vel.shape} shape[0] {gal_vel.shape[0]}")
-            print(f"debug: shape {gal_mass.shape} shape[0] {gal_mass.shape[0]}")
-            t += dt
-
-            # transfers
-            tidal_radius = TIDAL_RADIUS_FACTOR * SPAWN_SIGMA_AU
-            for i in range(N):
-                gidx = body_gal[i]
-                rmag = np.linalg.norm(pos[i] - gal_pos[gidx])
-                if rmag > tidal_radius:
-                    nearest_g = gidx
-                    nearest_d = rmag
-                    for g in range(M):
-                        if g == gidx: continue
-                        d = np.linalg.norm(pos[i] - gal_pos[g])
-                        if d < nearest_d:
-                            nearest_d = d
-                            nearest_g = g
-                    if nearest_g != gidx:
-                        body_gal[i] = nearest_g
-                        gal_mass[nearest_g] += masses[i]
-                        gal_mass[gidx] -= masses[i]
-
-            # merges
-            merged = False
-            for a in range(M):
-                for b in range(a+1, M):
-                    d = np.linalg.norm(gal_pos[a] - gal_pos[b])
-                    if d < MERGE_DIST_AU:
-                        total_mass = gal_mass[a] + gal_mass[b]
-                        new_pos = (gal_mass[a]*gal_pos[a] + gal_mass[b]*gal_pos[b]) / total_mass
-                        new_vel = (gal_mass[a]*gal_vel[a] + gal_mass[b]*gal_vel[b]) / total_mass
-                        gal_pos[a] = new_pos
-                        gal_vel[a] = new_vel
-                        gal_mass[a] = total_mass
-                        for i in range(N):
-                            if body_gal[i] == b:
-                                body_gal[i] = a
-                        if b != M-1:
-                            gal_pos[b] = gal_pos[M-1].copy()
-                            gal_vel[b] = gal_vel[M-1].copy()
-                            gal_mass[b] = gal_mass[M-1]
-                            for i in range(N):
-                                if body_gal[i] == M-1:
-                                    body_gal[i] = b
-                        M -= 1
-                        gal_pos = gal_pos[:M]
-                        gal_vel = gal_vel[:M]
-                        gal_mass = gal_mass[:M]
-                        merged = True
-                        break
-                if merged:
-                    break
-
-            # split logic
-            for g in range(M):
-                assigned = np.where(body_gal == g)[0]
-                if assigned.size == 0:
-                    continue
-                distances = np.linalg.norm(pos[assigned] - gal_pos[g], axis=1)
-                split_radius = 3.0 * SPAWN_SIGMA_AU
-                frac_out = np.sum(distances > split_radius) / assigned.size
-                if frac_out > SPLIT_FRAC and gal_mass[g] > 2e6:
-                    esc_idxs = assigned[distances > split_radius]
-                    centroid = pos[esc_idxs].mean(axis=0)
-                    new_mass = np.sum(masses[esc_idxs])
-                    gal_mass[g] -= new_mass
-                    gal_pos = np.vstack([gal_pos, centroid])
-                    gal_vel = np.vstack([gal_vel, np.zeros(3)])
-                    gal_mass = np.concatenate([gal_mass, np.array([new_mass])])
-                    new_g = gal_pos.shape[0]-1
-                    for i in esc_idxs:
-                        body_gal[i] = new_g
-                    M += 1
-
-        snapshots_pos[s_idx] = pos
-        snapshots_vel[s_idx] = vel
-        pct = int(100.0 * (s_idx) / (n_snap-1))
-        print(f"{pct}% complete (t = {t:.2f} yr)")
-
-    os.makedirs("data", exist_ok=True)
-    np.savez("data/galaxy_sim_hecate.npz",
-             body_positions = snapshots_pos,
-             body_velocities = snapshots_vel,
-             body_masses = masses,
-             body_galaxy = body_gal,
-             galaxy_positions = gal_pos,
-             galaxy_masses = gal_mass,
-             times = save_times)
-    print("Saved data/galaxy_sim_hecate.npz")
-
-# ----------------- main -----------------
-if __name__ == "__main__":
-    try:
-        catalog_file = ensure_catalog()
-    except Exception as e:
-        print("Catalog download failed:", e)
-        sys.exit(1)
-    t0 = perf_counter()
-    simulate_from_catalog(catalog_file)
-    t1 = perf_counter()
-    print("Elapsed (s):", t1-t0)
