@@ -1,4 +1,5 @@
 import taichi as ti #main tool
+import taichi.math as tm #math functions and vector types
 import numpy as np #for generating data
 
 # Initialize Taichi with GPU support for better performances
@@ -7,9 +8,9 @@ ti.init(arch=ti.gpu)
 #physical parameters
 N = 100_000 #number of particles
 m = 40000 #mass of each particle(unit less)
-eps = 1e+1
-energy = 0.00005
-dt = 0.001
+eps = 1e+0 #softening parameter
+energy = 0.00000005 #energy parameter
+dt = 0.001 #time step
 
 #display parameters
 center_x = 0
@@ -31,7 +32,6 @@ display_pos = ti.Vector.field(2, dtype=ti.f32, shape=N)
 #Generate random positions and velocities for the particles. The velocities are set to be perpendicular to the position vectors.
 pos_np = np.random.rand(N,2)*500-250
 mag = np.linalg.norm(pos_np, axis=1, keepdims=True)
-print(mag.shape)
 vel_np = np.empty_like(pos_np)
 vel_np[:,0] = -pos_np[:,1] * mag[::-1].T
 vel_np[:,1] =  pos_np[:,0] * mag[::-1].T
@@ -46,21 +46,19 @@ def compute_accelerations():
     """
     Computes the forces acting on each particle due to the gravitational attraction of all other particles
     """
-
-    #zero forces
+    #zero accelerations
     for i in range(N):
         accelerations[i] = 0
-    ti.block_local(positions)
 
+    ti.block_local(positions)
     #loop over all pairs of particles and compute the force between them. (applied only to one of them for parallelization)
     for i in range(N):
          for j in range(N):
             d = positions[j] - positions[i]
             dist2 = d.dot(d) + eps
             inv_r = ti.rsqrt(dist2)
-            inv = inv_r * inv_r * inv_r
-            a = m * d * inv #G = 1
-            accelerations[i] += a
+            inv3 = inv_r * inv_r * inv_r
+            accelerations[i] += m * d * inv3 #G = 1
 
 @ti.kernel
 def step():
@@ -74,7 +72,7 @@ def step():
 
     #drift
     for i in range(N):
-        positions[i] += dt * accelerations[i]
+        positions[i] += dt * velocities[i]
 
     #half-kick
     compute_accelerations()
@@ -93,7 +91,7 @@ def to_display(center_x: float, center_y: float, world_x: float, world_y: float)
 
 
 #initialize the window and scene
-window = ti.ui.Window("Orbits", res=(2100,2100))
+window = ti.ui.Window("Simulation", res=(800,800))
 canvas = window.get_canvas()
 scene  = window.get_scene()
 
